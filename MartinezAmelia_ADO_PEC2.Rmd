@@ -1,0 +1,864 @@
+---
+title: 'PEC2_Anàlisi de dades òmiques: ANÀLISI RNA SEQ AMB R.'
+author: "Amelia Martínez Sequera"
+date: ' Juny 2020'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("~/R/PEC2_ADO")
+library(DESeq)
+library(baySeq)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(Glimma)
+library(gplots)
+library(org.Mm.eg.db)
+library(RColorBrewer)
+targets <- read_csv("targets.csv")
+counts <- read_delim("counts.csv", ";", escape_double = FALSE, 
+    trim_ws = TRUE)
+
+```
+## Continguts:
+
+1. Introducció.
+2. Selecció de les dades.
+3. Anàlisi i visualització exploratòries.  
+3.1 Pre-filtratge del conjunt de dades.  
+3.2 Conversió a DGEList.  
+3.3 Control de qualitat.  
+3.4 Normalització.  
+4. Anàlisi de l'expressió diferencial.  
+4.1 Exploració de les dades.  
+4.2 Estimació de la dispersió.  
+4.3 Expressió diferencial.  
+4.4 GLM.  
+5. Anotació i visualització dels resultats.  
+5.1 Anotació de gens.  
+5.2 Visualització dels resultats.  
+5.3 Recuperació d´ubicacions genòmiques.  
+5.4 Visió general de Genomic Ranges.  
+6. Exportació de pistes.  
+7. Anàlisi de significació biològica competitiva(“Gene Enrichment Analysis”).  
+7.1 GOseq.   
+7.2 FGSEA.  
+7.3 CAMERA.  
+8. Proves de significació biològica autònomes.  
+8.1 ROAST.  
+
+# 1. Introducció.
+En aquest anàlisi ens interessa fonamentalment l´expressió diferencial entre 3 grups, amb 10 mostres cadascun, obtingudes de 54 teixits de tiroides:
+
+  - sense infiltració linfoide: NIT,
+  - localment infiltrat: SFI,
+  - extensament infiltrats: ELI.
+ 
+Disposem doncs, de rèpliques tècniques i biològiques.
+
+Partirem de dades preprocessades, és a dir, l´extracció de RNA, preparació de llibreries i la seqüenciació són qüestions que no tractarem. Tanmateix, aquestes seqüències ja han estat alineades amb un genoma de referència. La nostra feina comença a partir dels recomptes, i ens interessa estudiar si aquests difereixen significativament entre els diferents grups o condicions biològiques.
+
+Les dades en brut no estan prèviament normalitzades. Això és important per seqüenciar la profunditat/mida de la biblioteca, ja que els models estadístics són més potents quan s'apliquen a recomptes no normalitzats, i estan dissenyats per tenir en compte les diferències de mida de la biblioteca (Love et Anders, 2019. *Flux de treball RNA-seq: anàlisi exploratòria a nivell de gens i expressió diferencial.*)
+
+
+# 2. Selecció de les mostres.
+A partir de l´arxiu *targets.csv* hem seleccionat 10 mostres de cada grup segons el tipus d´infiltració (NIT, SFI i ELI), sense tenir en compte el sexe ni el tipus de dades moleculars.
+
+Tot i que ens basarem principalment en la comparació entre grups d´infiltració, hem procurat tenir mostres tant de *RNA Seq(NGS)(Next Generation Sequencing)* com d´*Allele-specific expression* (tipus de dades moleculars segons la llista de dbGap (http://www.ncbi.nlm.nih.gov/gap), base de dades de genotips i fenotips). El segon tipus fa referència a un subconjunt de gens (també SNPs i INDELs) que mostra una desviació a la presentació igual prevista dels al.lels parentals (autosòmics) i expressa preferentment l´al.lel d´un sol progenitor. En canvi, les dades tipus *RNA seq(NGS)* poden ser transcriptomes sencers, exomes,... poden incloure elements tant codificants com no codificants. 
+
+Verifiquem que les files de *Sample_Name* es corresponen amb les columnes de l´arxiu *counts.csv* i extraiem la nostra matriu de recompte, sense incorporar la primera columna perquè conté els id de la llibreria (56202 files). Nota: anomenarem "gens" a  cada un dels intèrvals genòmics o elements de la llibreria (etiquetes), tot i que a priori no sabem si es tracta de gens o altres tipus de transcrits (ho analitzarem més endavant).
+
+Per fer la selecció, simplement hem agafat els primers valors (de dalt a baix, primer les 3 columnes de l´esquerra i després les últimes columnes)de la matriu lògica. Per exemple, del grup ELI les files 29,100,3,186,211,253,167,251,146,147 de *targets.csv*, que es corresponen a aquestes columnes+1 de l´arxiu *counts.csv*.
+```{r, include=F, echo=F}
+targets$Sample_Name==colnames(counts)[-1]
+targets$Group=="ELI"
+```
+
+Treballarem doncs amb uns arxius "reduits" que només contenen 30 mostres:
+```{r, include=F}
+targets2<- targets[c(1,15,43,57,71,85,113,127,141,155,99,30,44,58,184,212,59,171,185,199,29,100,3,186,211,253,167,251,146,147),]
+mydata<-counts[,c(2,16,44,58,72,86,114,128,142,156,100,31,45,59,185,213,60,172,186,200,30,101,4,187,212,254,168,252,147,148)]
+colnames(mydata)<- c("NIT1","NIT2","NIT3","NIT4","NIT5","NIT6","NIT7","NIT8","NIT9","NIT10","SFI1","SFI2","SFI3","SFI4","SFI5","SFI6","SFI7","SFI8","SFI9","SFI10","ELI1", "ELI2","ELI3","ELI4","ELI5","ELI6","ELI7","ELI8","ELI9","ELI10")
+View(mydata)
+counts[,1]=rownames(mydata)
+write.csv(mydata, file="galaxydata")
+```
+
+# 3. Anàlisi i visualització exploratòries.
+
+## 3.1. Filtrar gens amb baixa expressió.
+
+Els gens amb un recompte molt baix proporcionen poca evidència per a l'expressió diferencial i interfereixen amb algunes de les aproximacions estadístiques que s'utilitzaran posteriorment en el pipeline. També s’afegeixen a la càrrega de proves múltiples a l’hora d’estimar taxes de descobriment falses, reduint el poder per detectar gens expressats de manera diferent. Aquests gens s’han de filtrar abans d’analitzar-ne més.
+
+En aquest conjunt de dades, optem per retenir gens si s’expressen en un recompte per milió (CPM) per sobre de 0.1 en almenys 2 mostres, ja que tenim rèpliques biològiques i tècniques de cada grup. S'utilitza un CPM de 0.1 ja que correspon a un recompte de aprox. 10 per a les mides de la biblioteca d'aquest conjunt de dades. Si el recompte és menor, es considera que és molt baix, cosa que indica que el gen associat no s’expressa en aquesta mostra. S'utilitza un requisit d'expressió en dues o més biblioteques. Filtrem amb CPMs en lloc de filtrar els recomptes directament, ja que aquest no té en compte les diferències en les mides de la biblioteca entre les mostres. Per generar els valors de CPM utilitzarem la funció cpm() de la biblioteca edgeR. (Robinson, McCarthy i Smyth, 2010) 
+S´ha de tenir en compte que mitjançant la conversió a CPM estem normalitzant les diferents profunditats de seqüenciació de cada mostra.
+```{r}
+col1sum <- sum(mydata[,1])/1000000
+mydata[1,1]/col1sum
+
+myCPM<- cpm(mydata)
+thresh<- myCPM>0.1
+
+# Cuants TRUEs hi ha?
+table(rowSums(thresh))
+
+# mantenim el gens que tenen, al menys, 2 TRUES en cada fila de thresh
+keep <- rowSums(thresh) >= 2
+
+# ens quedem amb 29593
+counts.keep <- mydata[keep,]
+summary(keep)
+dim(counts.keep)
+```
+
+```{r plotCPMThreshold}
+# Comprovem si el nostre llindar de 0.1 correspon a un recompte aproximat a 10. Mirem la primera mostra:
+par(mfrow=c(1,2))
+plot(myCPM[,1], mydata$NIT1, xlab="CPM", ylab="Raw Count", main=colnames(myCPM)[1])
+abline(v=0.1)
+
+plot(myCPM[,1],mydata$NIT1, xlab="CPM", ylab="Raw Count", main=colnames(myCPM)[1], 
+     ylim=c(0,50), xlim=c(0,3), col="green")
+abline(v=0.1, h=10,col="blue")
+```
+```{r}
+par(mfrow=c(1,2))
+plot(myCPM[,2],mydata$NIT2, xlab="CPM", ylab="Raw Count", main=colnames(myCPM)[2], 
+     ylim=c(0,50), xlim=c(0,2), col="green")
+abline(v=0.1, h=10,col="blue")
+plot(myCPM[,11],mydata$SFI1, xlab="CPM", ylab="Raw Count", main=colnames(myCPM)[11], 
+     ylim=c(0,50), xlim=c(0,2), col="green")
+abline(v=0.1, h=10,col="blue")
+
+```
+
+Els gens amb un valor CPM inferior a un determinat cutoff es considera que és molt baix, cosa que indica que el gen associat no s’expressa en aquesta mostra. Els llindars de CPM més petits solen ser adequats per a biblioteques més grans. 
+
+## 3.2. Conversió a DGEList.
+A continuació, crearem un objecte DGEList. Aquest és un objecte utilitzat per edgeR per emmagatzemar dades de recompte. Disposa de diversos "slots" (ranures) per emmagatzemar diversos paràmetres sobre les dades.La informació sobre la mida de la biblioteca es desa a la ranura mostral.
+
+```{r}
+dgeObj <- DGEList(counts.keep)
+dgeObj
+```
+```{r}
+head(dgeObj$counts)
+```
+
+## 3.3. Control de qualitat
+Anema a comprovar que les dades són de bona qualitat i que les mostres són com esperaríem.
+
+### Mida de la llibreria.
+Primer, podem comprovar quantes lectures tenim per a cada mostra del dgeObj.
+```{r}
+dgeObj$samples
+
+#dgeObj$samples$lib.size
+#dgeObj$samples[,2]
+#dgeObj$samples[,"lib.size"]
+```
+
+### Gràfica de densitat.
+Podem fer una gràfica de barres per veure amb més facilitat si hi ha discrepàncies importants entre les mostres.
+```{r}
+barplot(dgeObj$samples$lib.size, names=colnames(dgeObj), las=2)
+title("Barplot de la mida de les biblioteques")
+```
+
+
+### Boxplots.
+Les dades de recompte no es distribueixen normalment. Utilitzarem boxplots per comprovar la distribució dels recomptes a l'escala log2. Podem utilitzar la funció cpm per obtenir recomptes de log2 per milió, que es corregeixen per a les diferents mides de la biblioteca. La funció de cpm també afegeix una petita compensació per evitar tenir registre de zero.
+```{r}
+logcounts <- cpm(dgeObj,log=TRUE)
+boxplot(logcounts, xlab="", ylab="Log2 counts per million",las=2, col=c(rep("blue",10), rep("yellow",10),rep("green",10)))
+abline(h=median(logcounts),col="red")
+title("Boxplots de logCPMs (no-normalitzats)")
+```
+
+Observem que les distribucions no són idèntiques però la mitjana s´ajusta bastant a la linia vermella, que correspòn a la mitjana de logCPM. 
+
+
+### Gràfiques d’escalació multidimensional (MDS).
+Una MDSplot és una visualització d’un PCA (anàlisi de components principals), que determina les majors fonts de variació de les dades. Un PCA és un exemple d'anàlisi no supervisada, en què no cal especificar els grups. Si el nostre experiment està ben controlat i ha funcionat bé, el que esperem veure és que les fonts més grans de variació de les dades són els tractaments/grups que ens interessen. També és una eina molt útil per controlar la qualitat i comprovar els outliers.
+```{r, include=F}
+group<- as.factor(targets2$Group)
+mol.type<- as.factor(targets2$molecular_data_type)
+col.cell <- c("purple","red","green")[group]
+data.frame(group,col.cell)
+```
+```{r}
+plotMDS(dgeObj, col=col.cell)
+
+```
+
+Les mostres del mateix grup s´haurien de veure més juntes. Veiem que les mostres del grup ELI s´agrupen al cuadrant superior dret, excepte ELI7. NIT i SFI clarament es posicionen a l´esquerra, excepte SFI4.
+Si a més tenim en comte el tipus de dada:
+```{r}
+par(xpd= T, mar = par()$mar + c(0,0,0,7))
+plotMDS(dgeObj,col=col.cell,pch =c(1,2)[mol.type])
+legend( 4.5,1.5,fill=c("purple","red","green"),legend=levels(group))
+legend(4.5,0.1, legend= levels(mol.type),pch=c(1,2))
+title("Tipus d´infiltració")
+par(mar=c(5, 4, 4, 2) + 0.1)
+
+
+```
+
+El que s´espera veure és que les mostres d’un mateix grup de grups apareguin més juntes, mentre que mostres de diferents grups formen agrupaments separats. Això indica que les diferències entre grups són més grans que dintre dels grups, és a dir, que l'expressió diferencial és més gran que la variància i es pot detectar.
+A la gràfica podem veure que la distància entre mostres NIT de l´esquerra i les mostres ELI de la dreta és d´aprox. una unitat, el que correspon a un canvi(fold change) de 2 ^ 1 = 2 entre els dos grups. 
+
+L’agrupament a la gràfica MDS es pot utilitzar per motivar canvis a la matriu de disseny a la llum dels possibles efectes del lot. Per exemple, si la primera rèplica de cada grup es va preparar en un moment diferent de la segona rèplica. Si la gràfica MDS mostrava la separació de les mostres per temps, pot valdre la pena incloure temps a l’anàlisi del flux descendent per tenir en compte l’efecte basat en el temps.
+
+plotMDS traça de manera predeterminada les dues primeres dimensions, però podem graficar d´altres:
+
+```{r}
+par(mfrow=c(1,2))
+plotMDS(dgeObj,dim=c(3,4), col=col.cell)
+plotMDS(dgeObj,dim=c(1,3), col=col.cell)
+
+```
+
+Una altra alternativa és fer una gràfica MDS interactiva mitjançant el paquet Glimma. Això ens permet explorar de forma interactiva les diferents dimensions.
+Glimma es va crear per fer versions interactives d'alguns dels gràfics més populars del paquet limma. Actualment, es pot utilitzar per obtenir gràfiques MDS i gràfics MD. La sortida de glMDSPlot és una pàgina html (/mds/MDS-Plot.html) que mostra la trama MDS a l’esquerra i la quantitat de variació explicada per cada dimensió en una barra de bar a la dreta. L'usuari pot passar per punts per obtenir informació de mostra i canviar entre les dimensions successives de la trama MDS fent clic a les barres de la barra de comandament. Les gràfiques MDS predeterminades mostren les dimensions 1 i 2.
+
+```{r}
+labels <- paste(targets2$Sample_Name, group, mol.type)
+group <- paste(group,mol.type,sep=".")
+glMDSPlot(dgeObj, labels=labels, groups=group, folder="mds")
+# html adjunt a la carpeta mds.
+```
+### Agrupació jeràrquica (clustering) amb heatmaps.
+
+Una alternativa al plotMDS per examinar les relacions entre mostres és l’ús de cluster jeràrquic. Podem fer-ho mitjançant la funció heatmap.2 del paquet gplots, que calcula una matriu de distàncies euclidianes des del logCPM per als 500 gens més variables.
+Farem servir el paquet RColorBrewer té esquemes de colors als quals s’accedeix mitjançant la funció brewer.pal. "RdYlBu" és una elecció habitual i "Spectral" també és agradable.
+La funció png crearà un fitxer png per guardar les trames creades immediatament després, i tancarà aquest fitxer quan es truqui dev.off (). Per veure les parcel·les de manera interactiva, ometeu les dues línies.
+
+Seleccionem les dades dels 500 gens més variables i traçem el mapa de calor
+
+```{r}
+# Estimem la variança per a cada fila en la matriu de logcounts:
+var_genes <- apply(logcounts, 1, var)
+head(var_genes)
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:500]
+head(select_var)
+highly_variable_lcpm <- logcounts[select_var,]
+dim(highly_variable_lcpm)
+
+mypalette <- brewer.pal(11,"RdYlBu")
+morecols <- colorRampPalette(mypalette)
+col.cell <- c("purple","red","green")[group]
+heatmap.2(highly_variable_lcpm, 
+          col=rev(morecols(50)),
+          trace="column", 
+          main="Top 500 gens més variables segons infiltració",
+          ColSideColors=col.cell,scale="row")
+
+png(file="High_var_genes.heatmap.png")
+heatmap.2(highly_variable_lcpm,col=rev(morecols(50)),trace="none", main="Top 500 most variable genes\nacross samples",ColSideColors=col.cell,scale="row")
+dev.off()
+```
+```{r solutionChallenge3, fig.height=8, fig.width=6}
+
+select_var <- names(sort(var_genes))[1:500]
+lowly_variable_lcpm <- logcounts[select_var,]
+mypalette <- brewer.pal(11,"PiYG")
+## http://colorbrewer2.org/#type=sequential&scheme=BuGn&n=3
+morecols <- colorRampPalette(mypalette)
+col.cell <- c("purple","red","green")[group]
+
+heatmap.2(lowly_variable_lcpm, 
+          col=rev(morecols(50)),
+          trace="none", 
+          main="   Top 500 gens més variables",
+          ColSideColors=col.cell,scale="row",
+          labCol=targets2$molecular_data_type, 
+          labRow = NA)
+
+```
+
+## 3.4. Normalització per biaix de composició.
+
+El mètode TMM (trimmed mean of M-values normalization method) es realitza per eliminar els biaixos de composició entre biblioteques (Mark D Robinson i Oshlack 2010). Això genera un conjunt de factors de normalització, on el producte d’aquests factors i les mides de la biblioteca defineixen la mida efectiva de la biblioteca. 
+
+La funció calcNormFactors en edgeR calcula els factors de normalització entre llibreries. TMM, i la major part dels mètodes de normalització, escalen en realció d una mostra. Això actualitzarà els factors de normalització de l'objecte DGEList (els seus valors per defecte són 1). Mirem els factors de normalització d’aquestes mostres:
+
+```{r}
+dgeObj <- calcNormFactors(dgeObj)
+head(dgeObj$samples)
+sort(dgeObj$samples$norm.factors, decreasing = T)
+
+```
+
+Els factors de normalització multipliquen per unificar totes les llibreries. Un factor de normalització inferior a 1 indica que es reduirà la mida de la biblioteca, ja que hi ha més supressió (és a dir, biaix de composició) respecte a les altres biblioteques. Això equival a escalar els recomptes cap amunt en aquesta mostra. Per contra, un factor superior a 1 augmentarà de mida de la biblioteca i equivaldrà a reduir els recomptes.
+
+SF2 i NIT1 presenten els factors de normalització menors, i els més grans són ELI2 i ELI10.Si traçem la diferència mitjana mitjançant la funció plotMD per a aquestes mostres, hauríem de ser capaços de veure el problema de biaix de la composició. Utilitzarem els "logcounts", que s’han normalitzat per la mida de la biblioteca, però no per al biaix de composició.
+```{r}
+par(mfrow=c(1,2))
+plotMD(logcounts,column = 22)
+abline(h=0,col="grey")
+plotMD(logcounts,column = 12)
+abline(h=0,col="grey")
+```
+
+Les gràfiques MD mostren una expressió mitjana (mitjana: eix x) contra canvis *log-fold* (diferència: eix y). Com que la nostra DGEList conté els factors de normalització, si féssim aquestes gràfiques mitjançant dgeObj, hauríem de veure que s’ha resolt el problema de biaix de composició.
+```{r plotNormedMD, fig.height=5, fig.width=10}
+par(mfrow=c(1,2))
+plotMD(dgeObj,column = 22)
+abline(h=0,col="grey")
+plotMD(dgeObj,column = 12)
+abline(h=0,col="grey")
+```
+
+
+# 4. Anàlisi de l´expressió diferencial.
+
+## 4.1. Exploració de dades.
+
+Una gràfica MDS mostra distàncies, en termes de coeficient biològic de variació (BCV), entre mostres.Ens dóna informació sobre la qualitat de les dades.
+```{r, include=F}
+group<- as.factor(targets2$Group)
+mol.type<- as.factor(targets2$molecular_data_type)
+col.cell <- c("purple","red","green")[group]
+
+```
+```{r}
+plotMDS(dgeObj,col=col.cell)
+```
+
+## 4.2. Estimació de la dispersió.
+
+El primer pas important en l'anàlisi de dades de DGE és estimar el paràmetre de dispersió de cada gen, una mesura del grau de variació "interbibliotecària" per a aquest gen. L’estimació de la dispersió comuna dóna una idea de la variabilitat global a través del genoma d’aquest conjunt de dades, promediada per a tots els gens:
+
+```{r}
+d1 <- estimateCommonDisp(dgeObj, verbose = T)
+```
+Per a l'anàlisi d'expressions diferencials rutinàries, s'utilitzen dispersions empíriques bayesianes amb etiquetes. Cal estimar la dispersió comuna abans d’estimar les dispersions amb les etiquetes.
+```{r}
+d1 <- estimateTagwiseDisp(d1)
+plotBCV(d1)
+```
+
+
+### Estimacions de dispersió GLM.
+
+Per encaixar un model a edgeR hem de seguir diversos passos. En primer lloc, cal adaptar-se a la dispersió comuna. Després cal adaptar-se a un model de tendència (si no s’adapta a una tendència, el valor per defecte és utilitzar la dispersió comuna com a tendència). A continuació, podem encaixar la dispersió en etiquetes, que és una funció d’aquest model.
+
+A més del dispersió comú i sense etiquetes, també podem estimar un model lineal generalitzat (glm) adequat amb edgeR. 
+A continuació, farem estimacions de dispersió genètiques, permetent una possible tendència amb la mida del recompte de mitjanes.
+plotBCV() traça el coeficient biològic de variació (arrel quadrada de les dispersions) contra log2-CPM:
+
+```{r}
+dgeObj$samples$group=c(rep("1",10),rep("2",10),rep("3",10))
+design.mat <- model.matrix(~ 0 + dgeObj$samples$group)
+colnames(design.mat) <- levels(dgeObj$samples$group)
+d2 <- estimateGLMCommonDisp(dgeObj,design.mat)
+d2 <- estimateGLMTrendedDisp(dgeObj,design.mat, method="power")
+# Es pot canviar el "method" a "auto", "bin.spline", "power", "spline", "bin.loess".
+# El mètode per defecte es "auto" que fa servir "bin.spline" per >200 etiquetes, i "power" en els altres casos.
+d2 <- estimateGLMTagwiseDisp(d2,design.mat)
+plotBCV(d2)
+```
+
+
+### Comparació dels models en DESeq i edgeR.
+
+Segons quin model fem servir s´obtenen diferents resultats. A la gràfica tenim dispersió a l´eix vertical, en comptes del BCV.
+
+```{r}
+cds <- newCountDataSet(data.frame(dgeObj$counts), dgeObj$samples$group)
+cds <- estimateSizeFactors( cds )
+sizeFactors( cds )
+cds <- estimateDispersions( cds , method="blind")
+plotDispEsts(cds)
+
+```
+
+
+### Dispersió i variació biològica.
+La dispersió d’un gen és simplement una altra mesura de la variància d’un gen i és usat per DESeq per modelar la variància global dels valors de recompte d’un gen. El model per a la variància \ (v \) dels valors de recompte utilitzat per DESeq és:
+
+\ [v = s \ mu + \ alpha s ^ 2 \ mu ^ 2 \ \ text {On} \ alpha \ text {és la dispersió,} \ mu \ text {és el valor de recompte normalitzat previst i} s \ text { és el factor de mida} \]
+
+La dispersió es pot interpretar com el quadrat del coeficient de variació biològica (per exemple, la diferència de recomptes entre dues rèpliques biològiques és del 40%, de manera que la dispersió del gen és \ (0,4 ^ 2 = 0,16 \)).
+
+
+
+## 4.3. Expressió diferencial.
+
+La funció exactTest() fa servir el test binomial negatiu. La funció topTags() mostra convenientment els resultats més significatius. Per defecte, s'utilitza l'algoritme de Benjamini i Hochberg per controlar la taxa de descobriment falsa (FDR).
+
+```{r}
+d1$samples$group=c(rep("1",10),rep("2",10),rep("3",10))
+d2$samples$group=c(rep("1",10),rep("2",10),rep("3",10))
+
+et12 <- exactTest(d1, pair=c(1,2)) # compara grups 1 i 2, NIT-SFI
+et13 <- exactTest(d1, pair=c(1,3)) # compara grups 1 i 3, NIT-ELI
+et23 <- exactTest(d1, pair=c(2,3)) # compara grups 2 i 3, SFI-ELI
+topTags(et12, n=10)
+```
+
+El nombre total de gens diferencialment expressats:
+```{r}
+de1 <- decideTestsDGE(et12, adjust.method="BH", p.value=0.05)
+de2 <- decideTestsDGE(et13, adjust.method="BH", p.value=0.05)
+de3 <- decideTestsDGE(et23, adjust.method="BH", p.value=0.05)
+
+summary(de1);summary(de2);summary(de3)
+```
+
+Clarament, les diferències més grans es troben entre els grups NIT i ELI, és a dir, entre no-infiltr. i extensament-infiltr.
+La funció plotSmear genera una gràfica dels canvis log-fold/log-cpm (anàlogament a una gràfica MA per a les dades de microarray):
+```{r}
+par(mfrow=c(1,3))
+de1tags12 <- rownames(d2)[as.logical(de1)] 
+plotSmear(et12, de.tags=de1tags12, main="NITvsSFI")
+abline(h = c(-2, 2), col = "blue")
+
+de1tags13 <- rownames(d2)[as.logical(de2)] 
+plotSmear(et13, de.tags=de1tags13, main="NITvsELI")
+abline(h = c(-2, 2), col = "blue")
+
+de1tags23 <- rownames(d2)[as.logical(de3)] 
+plotSmear(et23, de.tags=de1tags23, main="SFIvsELI")
+abline(h = c(-2, 2), col = "blue")
+
+
+```
+
+## 4.4. GLM (model lineal generalitzat) per l´expressió diferencial.
+El fem servir per trobar les etiquetes que ens interessen fent servir un criteri de verosimil.litud.
+Primer hem de crear una matriu de disseny per als grups. El principal supòsit aquí és que no influeix si les dades son NGS o "allele-specific expression". 
+```{r}
+gr<-as.character(group)
+
+#Comparem únicament les diferències entres els grups d´infiltració:
+design.mat<-model.matrix(~0+dgeObj$samples$group)
+design.mat
+```
+
+i ajustem el model lineal:
+
+```{r}
+fit <- glmFit(d2, design.mat)
+head(fit$coefficients)
+```
+
+
+```{r}
+# si comparem (group 1 - group 2) amb 0, equival a comparar grups 1 i 2
+lrt12 <- glmLRT(fit, contrast=c(1,-1,0))
+lrt13 <- glmLRT(fit, contrast=c(1,0,-1))
+lrt23 <- glmLRT(fit, contrast=c(0,1,-1))
+topTags(lrt13, n=10)
+```
+
+i els gens més diferencialment expressats són:
+```{r}
+par(mfrow=c(1,3))
+dlr1 <- decideTestsDGE(lrt12, adjust.method="BH", p.value = 0.05)
+dlrtags12 <- rownames(d2)[as.logical(de1)]
+plotSmear(lrt12, de.tags=dlrtags12, main="NITvsSFI")
+abline(h = c(-2, 2), col = "blue")
+
+dlr2 <- decideTestsDGE(lrt13, adjust.method="BH", p.value = 0.05)
+dlrtags13 <- rownames(d2)[as.logical(de2)]
+plotSmear(lrt13, de.tags=dlrtags13, main="NITvsELI")
+abline(h = c(-2, 2), col = "blue")
+
+dlr3 <- decideTestsDGE(lrt23, adjust.method="BH", p.value = 0.05)
+dlrtags23 <- rownames(d2)[as.logical(de3)]
+plotSmear(lrt23, de.tags=dlrtags23, main="SFIvsELI")
+abline(h = c(-2, 2), col = "blue")
+```
+
+Suposem ara que tenim dues variables, tipus d´infiltració i tipus mol.lecular. Només mostrarem els primers pasos d´aquest supòsit, ja que no ens interessen aquests resultats. El nostre anàlisi està basat en l´expressió diferencial entre els grups amb diferent grau d´infiltració.
+
+```{r, include=F}
+gr <- paste(group,mol.type,sep=".")
+gr<- as.character(gr)
+# Creem les dues variables i la matriu de disseny amb terme d´intercepció:
+infiltr <- sapply(strsplit(gr, ".", fixed=T), function(x) x[1])
+type <- sapply(strsplit(gr, ".", fixed=T), function(x) x[2])
+design <- model.matrix(~infiltr+type)
+design
+
+
+```
+
+```{r}
+fit2 <- glmFit(d2, design)
+head(coef(fit2))
+```
+```{r}
+lr <- glmLRT(fit2, coef=2)
+topTags(lr)
+```
+
+
+```{r}
+results<- as.data.frame(topTags(lrt13, n=Inf))
+```
+```{r}
+summary(de <- decideTestsDGE(lrt13))
+summary(dlr2)
+```
+
+```{r}
+detags <- rownames(d2)[as.logical(de)]
+plotSmear(lrt13, de.tags=detags)
+```
+
+
+# 5. Annotació i visualització dels resultats.
+
+## 5.1. Annotació de gens.
+Ho farem mitjançant el paquet org.Mm.eg.db(), que és un dels diversos paquets *organism-level* que es reconstrueixen cada 6 mesos. Aquests paquets es mostren a la secció d’anotació de Bioconductor(http://bioconductor.org/packages/release/BiocViews.html#___AnnotationData). Un enfocament alternatiu és utilitzar biomaRt, una interfície del recurs BioMart.
+
+```{r}
+ann <- select(org.Mm.eg.db,keys=rownames(results),columns=c("ENTREZID","SYMBOL","GENENAME"))
+ann[1:20,]
+```
+
+Es pot afegir l´anotació als resultats:
+```{r}
+results.annotated <- cbind(results, ann)
+results.annotated[1:25,]
+
+```
+```{r}
+write.csv(results.annotated,file="NITvsELIResults.csv",row.names=FALSE)
+```
+
+Per decidir quins gens s’expressen de manera diferent, normalment prenem un tall de 0,05 sobre el valor p ajustat, NO el valor p brut. Això es deu al fet que estem provant més de 25000 gens i les probabilitats de trobar gens expressats de manera diferent són molt elevades quan fem moltes proves. Per tant, hem de controlar la taxa de descobriment fals(FDR), que és la columna de valor p ajustada a la taula de resultats. El que això significa és que si 100 gens són significatius a un percentatge de descobriment fals del 5%, estem disposats a acceptar que 5 seran falsos positius. La funció decideTests() mostra gens significatius al 5% de FDR.
+
+## 5.2. Visualització dels resultats.
+Podem fer un volcano plot per veure gràficament aquests gens més significatius:
+
+```{r}
+signif <- -log10(results.annotated$FDR)
+plot(results.annotated$logFC,signif,pch=16)
+points(results.annotated[detags,"logFC"],-log10(results.annotated[detags,"FDR"]),pch=16,col="red")
+```
+
+Abans de fer un seguiment dels gens diferencialment expressats amb més treballs de laboratori, es recomana fer una revisió per comprovar els nivells d’expressió de les mostres individuals per als gens d’interès. Podem mirar ràpidament l’expressió agrupada mitjançant stripchart.
+```{r}
+library(RColorBrewer)
+par(mfrow=c(1,3))
+normCounts <- d2$counts
+# Per al gen Tenm2:
+stripchart(normCounts["23964",]~group,vertical=T,las=2,cex.axis=0.8,pch=16,col=1:6,method="jitter")
+```
+```{r}
+nice.col <- brewer.pal(6,name="Dark2")
+stripchart(normCounts["23964",]~group,vertical=TRUE,las=2,cex.axis=0.8,pch=16,cex=1.3,col=nice.col,method="jitter",ylab="Normalised log2 expression",main=" Tenm2")
+```
+
+## 5.3. Recuperació d´ubicacions genòmiques.
+Volem recuperar les coordenades dels nostres gens més significatius. Com no sabem amb quin genoma estem treballant, primer provarem amb el genoma humà hg19:
+```{r}
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+tx<-TxDb.Hsapiens.UCSC.hg19.knownGene
+keytypes(tx)
+#Prenem els 3 primers gens, Tenm2, Ctsd i Naip6:
+keys <- c("23964","13033","17952")
+#select(tx, keys=keys,
+#       keytype = "GENEID",
+#       columns=c("EXONCHROM","EXONSTART","EXONEND")
+#      )
+```
+ No obtenim cap resultat, provem doncs amb el genoma de ratolí mm10:
+```{r}
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+tx2 <- TxDb.Mmusculus.UCSC.mm10.knownGene
+select(tx2, keys=keys,
+       keytype = "GENEID",
+       columns=c("EXONCHROM","EXONSTART","EXONEND")
+      )
+
+```
+ 
+## 5.4. Visió general de GenomicRanges.
+
+GenomicRanges s´utilitza per manipular els intervals genòmics(https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3738458/pdf/pcbi.1003118.pdf). Ens permet realitzar operacions comunes a intervals, com ara la superposició i el recompte. Podem definir la posició cromosòmica, inicial i final de cada regió.
+```{r}
+library(GenomicRanges)
+chrs <- c("chr11", "chr13","chr7")
+start <- c(36000000, 100000000, 142000000)
+end <- c(37300000,101000000, 143000000)
+my.ranges <- GRanges(rep(chrs,3), 
+                     IRanges(start=rep(start,each=3),
+                             end = rep(end,each=3)))
+my.ranges
+```
+
+Hi ha diverses funcions útils per calcular les propietats de les dades. Més que per l’anàlisi d’ARN-seq, GenomicRanges s’utilitza a Bioconductor per a l’anàlisi de dades de NGS.
+
+Per exemple, podem identificar regions sovint superposades entre dues GenomicRanges.
+
+```{r}
+
+genePos <- select(tx2, keys=keys,
+       keytype = "GENEID",
+       columns=c("EXONCHROM","EXONSTART","EXONEND")
+      )
+geneRanges <- GRanges(genePos$EXONCHROM, IRanges(genePos$EXONSTART,genePos$EXONEND), GENEID=genePos$GENEID)
+geneRanges
+```
+```{r}
+findOverlaps(my.ranges,geneRanges)
+```
+
+
+```{r}
+seqlevelsStyle(geneRanges)
+```
+### Recuperació de les coordenades genètiques com a GenomicRanges.
+La sortida de exonsBy és una llista d´exons:
+```{r}
+exo <- exonsBy(tx2,"gene")
+exo
+```
+Per accedir a l'estructura d'un determinat gen, podem utilitzar la sintaxi [[]] amb el nom del gen (Entrez gen ID) entre cometes. Si volguéssim una regió sencera que abasta el gen, podríem utilitzar la funció range
+```{r}
+range(exo[["23964"]])
+```
+
+# 6. Exportació de pistes.
+
+També és possible guardar els resultats d’una anàlisi de bioconductors en un navegador per permetre l’anàlisi i la integració interactives amb altres tipus de dades o compartir amb col·laboradors. Per exemple, potser voldríem que una pista del navegador indiqui on es troben els nostres gens expressats de manera diferent. Utilitzarem el bedformat per mostrar aquestes ubicacions. Anotarem els intervals amb informació de la nostra anàlisi, com ara el canvi de plec i la importància.
+
+Primer creem un marc de dades només per als gens DE.
+```{r}
+sigGenes <- results.annotated[detags,]
+sigGenes[1:15,]
+```
+Fem la funció range() per obtenir un únic rang per a cada gen i tranformar-lo a un objecte més convenient.
+```{r}
+exoRanges <- unlist(range(exo))
+sigRegions <- exoRanges[na.omit(match(sigGenes$ENTREZID, names(exoRanges)))]
+sigRegions
+```
+
+En lloc de només representar les ubicacions genòmiques, el format .bed també és capaç de acolorir cada rang d'acord amb alguna propietat de l'anàlisi (per exemple, la direcció i la magnitud del canvi) per ajudar a ressaltar determinades regions d'interès. També es pot mostrar una puntuació quan es fa clic en una regió. Una utilitat útil de GenomicRanges és que podem adjuntar metadades a cada rang mitjançant la funció mcols. Les metadades es poden subministrar en forma de marc de dades.
+```{r}
+mcols(sigRegions) <- sigGenes[match(names(sigRegions), rownames(sigGenes)),]
+sigRegions
+```
+
+Les metadades que hem afegit també es poden utilitzar com a mitjà per interrogar els intervals; com si les dades estiguessin contingudes en un marc de dades.
+```{r}
+sigRegions[order(sigRegions$LR,decreasing = TRUE)]
+```
+```{r, include=F}
+seqlevels(sigRegions)
+```
+```{r}
+Score <- -log10(sigRegions$FDR)
+```
+
+Ara crearem una puntuació a partir dels valors p que es mostraran a cada regió i l’esquema de colors per a les regions en funció del *fold-change*. Per a la puntuació podem utilitzar el $-log_{10}$ del valor p ajustat.
+A l’hora d’escollir paletes de colors, ens podem preocupar de que siguin adequades per a daltònics . L’esquema de colors vermell/verd aplicat tradicionalment als microarrays és una *mala* elecció.
+
+```{r}
+rbPal <-colorRampPalette(c("red", "blue"))
+logfc <- pmax(sigRegions$logFC, -5)
+logfc <- pmin(logfc , 5)
+Col <- rbPal(10)[as.numeric(cut(logfc, breaks = 10))]
+```
+Els colors i la puntuació s’han de desar a  GRanges com a score i itemRgb respectivament, i s’utilitzaran per construir la pista del navegador.
+Ara podem exportar els resultats significatius de l’anàlisi d´expressió diferencial com a .bed utilitzant rtracklayer. Es pot carregar el fitxer resultant a IGV.
+```{r}
+mcols(sigRegions)$score <- Score
+mcols(sigRegions)$itemRgb <- Col
+```
+```{r}
+library(rtracklayer)
+export(sigRegions , con = "topHits.bed")
+```
+# 7. Proves de significació biològica competitives.
+
+## 7.1. Anàlisi GOseq.
+GOseq és un mètode per realitzar un anàlisi ontològic de gens, adequat per a dades de RNA-seq, ja que dóna compte del biaix de longitud del gen en la detecció de sobrerepresentació.
+
+Primerament, GOseq ha de quantificar el biaix de longitud present al conjunt de dades a considerar.
+Això es fa calculant una funció de ponderació de probabilitats o PWF, que es pot pensar com una funció que dóna la probabilitat que un gen s’expressi diferencialment (DE), basat només en la seva longitud.
+El PWF es calcula ajustant una spline monotònica a la sèrie de dades binàries d’expressió diferencial (1 = DE, 0 = Not DE) en funció de la longitud del gen.
+El PWF s'utilitza per ponderar la possibilitat de seleccionar cada gen quan es formi una distribució nul·la per a membres de la categoria GO.
+El fet que el PWF es calculi directament a partir del conjunt de dades analitzat fa que aquest plantejament sigui robust, només corregint el biaix de longitud present a les dades.
+"L'anàlisi de GO de dades de RNA-seq requereix l'ús de mostreig aleatori per generar una distribució nula adequada per a membres de la categoria GO i calcular la importància de cada categoria per a la sobrerepresentació entre els gens DE. En la majoria dels casos, la distribució de Wallenius es pot utilitzar per aproximar la distribució nul real, sense cap pèrdua significativa de precisió. El paquet goseq implementa aquesta aproximació com a opció predeterminada. " (GOseq vignette)
+
+Creem una llista de DEG:
+
+```{r}
+print(head(results))
+genes <- results$FDR < 0.01
+names(genes) <- rownames(results)
+print(head(genes))
+```
+
+Ajustem la PWF:
+
+```{r}
+library(goseq)
+#print(supportedGeneIDs())
+#print(supportedGenomes())
+pwf <- nullp(genes, "mm10","knownGene")
+
+```
+
+Fem l´anàlisis d’enriquiment (*Gen Enrichment Analysis*):
+
+```{r}
+go.results <- goseq(pwf, "mm10","knownGene")
+go.results[1:15,]
+```
+
+## 7.2. FGSEA.
+ 
+L'anàlisi d'enriquiment ràpid de conjunts genètics pre-consultats (GSEA) es realitza:
+
+  - classificant tots els gens del conjunt de dades segons la seva correlació amb el fenotip escollit,
+  - identificant les posicions de rang de tots els membres del conjunt de gens i
+  - calculant una puntuació d’enriquiment (ES) que representa la diferència entre els rànquings observats i el que s’esperaria suposant una distribució de rànquing aleatori.
+
+“Després d’establir l’ES per a cada grup de gens a través del fenotip, GSEA reiteradament randomitza les etiquetes de les mostres i torna a fer l’enriquiment a través de les classes aleatòries. Mitjançant repetides randomitzacions d’etiquetes de classe, es pot comparar l’ES de cada conjunt de gens a través de les classes veritables amb la distribució ES de les classes aleatòries. Es consideren significatius aquells conjunts de gens que superen significativament les permutacions iteratives de classe aleatòria. " De fgsea[vignette] (http://www.bioconductor.org/packages/release/bioc/vignettes/fgsea/inst/doc/fgsea-tutorial.html) "fast preranked gene set enrichment analysis (GSEA)".
+
+```{r}
+library(fgsea)
+results.ord <- results[ order(-results[,"logFC"]), ]
+head(results.ord)
+ranks <- results.ord$logFC
+names(ranks) <- rownames(results.ord)
+head(ranks)
+```
+
+```{r}
+barplot(ranks)
+```
+
+Carreguem les rutes:
+```{r}
+load("mouse_H_v5.rdata")
+pathways <- Mm.H
+```
+Anàlisi de conducta:
+```{r}
+fgseaRes <- fgsea(pathways, ranks, minSize=15, maxSize = 500, nperm=1000)
+fgseaRes[order(padj), ]
+```
+
+
+```{r, include=F}
+class(fgseaRes)
+dim(fgseaRes)
+```
+
+```{r}
+tmpInd <- match(pathways[["HALLMARK_APOPTOSIS"]],names(ranks))
+tmpInd <- tmpInd[!is.na(tmpInd)]
+ranks2 <- rep(0,length(ranks))
+ranks2[tmpInd] <- ranks[tmpInd]
+barplot(ranks2)
+```
+
+
+```{r}
+plotEnrichment(pathways[["HALLMARK_APOPTOSIS"]],
+               ranks)
+```
+
+[GSEA article](http://www.pnas.org/content/102/43/15545.full) 
+
+```{r}
+topPathwaysUp <- fgseaRes[ES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(pathways[topPathways], ranks, fgseaRes, 
+              gseaParam = 0.5)
+```
+
+## 7.3. CAMERA.
+
+Altres bases de dades de conjunts de gens disponibles són procedents de la  MSigDB del Broad Institute (Broad Institute's Molecular Signatures Database ([MSigDB](http://software.broadinstitute.org/gsea/msigdb)). [CAMERA](https://academic.oup.com/nar/article/40/17/e133/2411151/Camera-a-competitive-gene-set-test-accounting-for)).
+CAMERA és una bona opció per contrastar un gran nombre de conjunts de gens, com els conjunts MSigDB, ja que és molt ràpid. Té l’avantatge de comptabilitzar la correlació intergènica de cada conjunt genètic (Wu i Smyth 2012) .
+
+Aquí utilitzarem els conjunts de gens C2 per al ratolí, disponibles com a fitxers .rdata de la pàgina de bioinformàtica WEHI http://bioinf.wehi.edu.au/software/MSigDB/index.html . Els conjunts de gens C2 contenen 4725 conjunts genètics de diversos llocs: BioCarta, KEGG, Pathway Interaction Database, Reactome, així com alguns estudis publicats. No inclou termes GO.
+
+```{r}
+load("mouse_c2_v5.rdata")
+names(Mm.c2)[1:5]
+length(Mm.c2)
+
+```
+
+Els identificadors del gen són Entrez Gene ID. Hem d’assignar els ID del gen Entrez entre la llista de conjunts de gens i la nostra llista. Podem fer-ho mitjançant la funció ids2indices().
+```{r}
+c2.ind <- ids2indices(Mm.c2, rownames(d2$counts))
+```
+De manera predeterminada, CAMERA pot estimar la correlació per a cada conjunt de gens per separat. Tanmateix, a la pràctica, funciona bé per establir una petita correlació intergència d´aprox. 0,05 mitjançant l’ argument *inter.gene.cor*.
+
+```{r}
+gst.camera<- camera.DGEList(d2,index=c2.ind,design=design.mat,contrast=2,inter.gene.cor=0.05)
+
+```
+Obtenim un dataframe de l´estadístic resultant, on cada fila correspòn a un grup de gens, ordenat pel p-value (encapçalat pel més significatiu). Mirem els 5 primers:
+
+```{r}
+gst.camera[1:5,]
+
+```
+
+El nombre total de genes significatius al 5% de FDR és:
+
+```{r}
+table(gst.camera$FDR < 0.05)
+```
+
+```{r}
+write.csv(gst.camera,file="gst.csv")
+```
+Fem ara el contrast amb mouse_H_v5.rdata (hallmark datasets):
+
+```{r}
+load("mouse_H_v5.rdata")
+H.ind <- ids2indices(Mm.H, rownames(d2$counts))
+H.camera <- camera.DGEList(d2,index=H.ind,design=design.mat,contrast=2,inter.gene.cor=0.05)
+table(H.camera$FDR < 0.05)
+H.camera[1:10,]
+```
+
+# 8. Proves de significació biològica autònomes.
+
+## 8.1. ROAST.
+ROAST és un exemple d’un test de gens autònom (Wu et al. 2010). Es fa la pregunta: "Els gens del meu conjunt solen expressar-se de manera diferent entre les meves condicions d'interès?". ROAST no utilitza informació sobre els altres gens de l’experiment, a diferència de CAMERA. ROAST és una bona opció per a quan estem interessats en un conjunt específic o en alguns conjunts. Realment no s´utilitza per contrastar milers de conjunts alhora (https://academic.oup.com/bioinformatics/article-lookup/doi/10.1093/bioinformatics/btq401).
+
+```{r}
+H.camera[1:10,]
+```
+
+Com hem obtingut un gen implicat a l´apoptosi, anem a comprovar si hi ha més en MsigDB C2:
+```{r}
+apop <- grep("APOPTOSIS_",names(c2.ind))
+names(c2.ind)[apop]
+```
+
+Utilitzem ROAST per veure si aquests conjunts de gens relacionats amb "APOPTOSIS" solen expressar-se de manera diferent(la sintaxi DE `camera` I `roast` és pràcticament idèntica).
+
+```{r}
+apop.rst <- roast.DGEList(d2,index=c2.ind[apop],design=design.mat,contrast=2,nrot=999)
+apop.rst[1:15,]
+```
+
+La columna NGenes indica el nombre de gens de cada conjunt.
+Les columnes PropDown i PropUp contenen les proporcions de gens del conjunt que estan regulades a la baixa i a l´alça, respectivament, amb canvis de plecs absoluts superiors a 2.
+La direcció neta del canvi es determina a partir de la significació dels canvis en cada direcció i es mostra a la columna Direcció.
+El PValue proporciona evidències de si la majoria de gens del conjunt són expressats diferencialment en la direcció especificada
+PValue.Mixed proporciona evidències de si la majoria de gens del conjunt són expressats diferencialment en qualsevol direcció.
+Les FDR es calculen a partir dels valors p corresponents a tots els conjunts.
+
+
+
