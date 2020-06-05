@@ -1,8 +1,9 @@
 ---
-title: 'PEC2_Anàlisi de dades òmiques: ANÀLISI RNA SEQ AMB R.'
+title: "PEC2_Anàlisi RNAseq amb R"
 author: "Amelia Martínez Sequera"
 date: ' Juny 2020'
 ---
+https://github.com/gititub/ADO_PEC2.RNAseqAnalysis
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -32,7 +33,7 @@ counts <- read_delim("counts.csv", ";", escape_double = FALSE,
 3.1 Pre-filtratge del conjunt de dades.  
 3.2 Conversió a DGEList.  
 3.3 Control de qualitat.  
-3.4 Normalització.  
+3.4 Normalització per biaix de composició.   
 4. Anàlisi de l'expressió diferencial.  
 4.1 Exploració de les dades.  
 4.2 Estimació de la dispersió.  
@@ -52,15 +53,14 @@ counts <- read_delim("counts.csv", ";", escape_double = FALSE,
 8.1 ROAST.  
 
 # 1. Introducció.
-En aquest anàlisi ens interessa fonamentalment l´expressió diferencial entre 3 grups, amb 10 mostres cadascun, obtingudes de 54 teixits de tiroides:
+En aquest anàlisi estudiarem els perfils d'expressió a partir d´unes dades preprocessades, és a dir, l´extracció de RNA, preparació de llibreries i la seqüenciació són qüestions que no tractarem. Tanmateix, aquestes seqüències ja han estat alineades amb un genoma de referència, i  s´han comptabilitzat el nombre de lectures mapades amb cada gen. Això es tradueix en una taula de recomptes (*counts.csv*), i ens interessa estudiar si aquests difereixen significativament entre els diferents grups o condicions biològiques.
+Ens interessa, fonamentalment,  l´expressió diferencial entre 3 grups, amb 10 mostres o rèpliques cadascun, obtingudes de 54 teixits de tiroides:
 
   - sense infiltració linfoide: NIT,
   - localment infiltrat: SFI,
   - extensament infiltrats: ELI.
  
 Disposem doncs, de rèpliques tècniques i biològiques.
-
-Partirem de dades preprocessades, és a dir, l´extracció de RNA, preparació de llibreries i la seqüenciació són qüestions que no tractarem. Tanmateix, aquestes seqüències ja han estat alineades amb un genoma de referència. La nostra feina comença a partir dels recomptes, i ens interessa estudiar si aquests difereixen significativament entre els diferents grups o condicions biològiques.
 
 Les dades en brut no estan prèviament normalitzades. Això és important per seqüenciar la profunditat/mida de la biblioteca, ja que els models estadístics són més potents quan s'apliquen a recomptes no normalitzats, i estan dissenyats per tenir en compte les diferències de mida de la biblioteca (Love et Anders, 2019. *Flux de treball RNA-seq: anàlisi exploratòria a nivell de gens i expressió diferencial.*)
 
@@ -73,13 +73,12 @@ Tot i que ens basarem principalment en la comparació entre grups d´infiltraci�
 Verifiquem que les files de *Sample_Name* es corresponen amb les columnes de l´arxiu *counts.csv* i extraiem la nostra matriu de recompte, sense incorporar la primera columna perquè conté els id de la llibreria (56202 files). Nota: anomenarem "gens" a  cada un dels intèrvals genòmics o elements de la llibreria (etiquetes), tot i que a priori no sabem si es tracta de gens o altres tipus de transcrits (ho analitzarem més endavant).
 
 Per fer la selecció, simplement hem agafat els primers valors (de dalt a baix, primer les 3 columnes de l´esquerra i després les últimes columnes)de la matriu lògica. Per exemple, del grup ELI les files 29,100,3,186,211,253,167,251,146,147 de *targets.csv*, que es corresponen a aquestes columnes+1 de l´arxiu *counts.csv*.
+
+Hem fet una nova matriu que conté només els recomptes de 30 mostres, però podem emmagatzemar els identificadors de gens (la primera columna d´EntrezGeneID). Més endavant afegirem més informació sobre anotacions sobre cada gen.
 ```{r, include=F, echo=F}
 targets$Sample_Name==colnames(counts)[-1]
 targets$Group=="ELI"
-```
 
-Treballarem doncs amb uns arxius "reduits" que només contenen 30 mostres:
-```{r, include=F}
 targets2<- targets[c(1,15,43,57,71,85,113,127,141,155,99,30,44,58,184,212,59,171,185,199,29,100,3,186,211,253,167,251,146,147),]
 mydata<-counts[,c(2,16,44,58,72,86,114,128,142,156,100,31,45,59,185,213,60,172,186,200,30,101,4,187,212,254,168,252,147,148)]
 colnames(mydata)<- c("NIT1","NIT2","NIT3","NIT4","NIT5","NIT6","NIT7","NIT8","NIT9","NIT10","SFI1","SFI2","SFI3","SFI4","SFI5","SFI6","SFI7","SFI8","SFI9","SFI10","ELI1", "ELI2","ELI3","ELI4","ELI5","ELI6","ELI7","ELI8","ELI9","ELI10")
@@ -92,23 +91,19 @@ write.csv(mydata, file="galaxydata")
 
 ## 3.1. Filtrar gens amb baixa expressió.
 
-Els gens amb un recompte molt baix proporcionen poca evidència per a l'expressió diferencial i interfereixen amb algunes de les aproximacions estadístiques que s'utilitzaran posteriorment en el pipeline. També s’afegeixen a la càrrega de proves múltiples a l’hora d’estimar taxes de descobriment falses, reduint el poder per detectar gens expressats de manera diferent. Aquests gens s’han de filtrar abans d’analitzar-ne més.
+Els gens amb un recompte molt baix proporcionen poca evidència per a l'expressió diferencial i interfereixen amb algunes de les aproximacions estadístiques que s'utilitzaran posteriorment en el pipeline. També s’afegeixen a la càrrega de proves múltiples a l’hora d’estimar taxes de descobriment falses (FDR), reduint el poder per detectar gens expressats de manera diferent. Aquests gens s’han de filtrar abans d’analitzar-ne més.
 
 En aquest conjunt de dades, optem per retenir gens si s’expressen en un recompte per milió (CPM) per sobre de 0.1 en almenys 2 mostres, ja que tenim rèpliques biològiques i tècniques de cada grup. S'utilitza un CPM de 0.1 ja que correspon a un recompte de aprox. 10 per a les mides de la biblioteca d'aquest conjunt de dades. Si el recompte és menor, es considera que és molt baix, cosa que indica que el gen associat no s’expressa en aquesta mostra. S'utilitza un requisit d'expressió en dues o més biblioteques. Filtrem amb CPMs en lloc de filtrar els recomptes directament, ja que aquest no té en compte les diferències en les mides de la biblioteca entre les mostres. Per generar els valors de CPM utilitzarem la funció cpm() de la biblioteca edgeR. (Robinson, McCarthy i Smyth, 2010) 
 S´ha de tenir en compte que mitjançant la conversió a CPM estem normalitzant les diferents profunditats de seqüenciació de cada mostra.
 ```{r}
 col1sum <- sum(mydata[,1])/1000000
 mydata[1,1]/col1sum
-
 myCPM<- cpm(mydata)
 thresh<- myCPM>0.1
-
 # Cuants TRUEs hi ha?
 table(rowSums(thresh))
-
 # mantenim el gens que tenen, al menys, 2 TRUES en cada fila de thresh
 keep <- rowSums(thresh) >= 2
-
 # ens quedem amb 29593
 counts.keep <- mydata[keep,]
 summary(keep)
@@ -139,14 +134,11 @@ abline(v=0.1, h=10,col="blue")
 Els gens amb un valor CPM inferior a un determinat cutoff es considera que és molt baix, cosa que indica que el gen associat no s’expressa en aquesta mostra. Els llindars de CPM més petits solen ser adequats per a biblioteques més grans. 
 
 ## 3.2. Conversió a DGEList.
-A continuació, crearem un objecte DGEList. Aquest és un objecte utilitzat per edgeR per emmagatzemar dades de recompte. Disposa de diversos "slots" (ranures) per emmagatzemar diversos paràmetres sobre les dades.La informació sobre la mida de la biblioteca es desa a la ranura mostral.
+A continuació, crearem un objecte *DGEList*. Aquest és un objecte utilitzat per *edgeR* per emmagatzemar dades de recompte. Disposa de diversos "slots" (ranures) per emmagatzemar diversos paràmetres sobre les dades.La informació sobre la mida de la biblioteca es desa a la ranura mostral.
 
 ```{r}
 dgeObj <- DGEList(counts.keep)
 dgeObj
-```
-```{r}
-head(dgeObj$counts)
 ```
 
 ## 3.3. Control de qualitat
@@ -233,13 +225,9 @@ glMDSPlot(dgeObj, labels=labels, groups=group, folder="mds")
 ```
 ### Agrupació jeràrquica (clustering) amb heatmaps.
 
-Una alternativa al plotMDS per examinar les relacions entre mostres és l’ús de cluster jeràrquic. Podem fer-ho mitjançant la funció heatmap.2 del paquet gplots, que calcula una matriu de distàncies euclidianes des del logCPM per als 500 gens més variables.
-Farem servir el paquet RColorBrewer té esquemes de colors als quals s’accedeix mitjançant la funció brewer.pal. "RdYlBu" és una elecció habitual i "Spectral" també és agradable.
-La funció png crearà un fitxer png per guardar les trames creades immediatament després, i tancarà aquest fitxer quan es truqui dev.off (). Per veure les parcel·les de manera interactiva, ometeu les dues línies.
-
 Seleccionem les dades dels 500 gens més variables i traçem el mapa de calor
 
-```{r}
+```{r, echo=F}
 # Estimem la variança per a cada fila en la matriu de logcounts:
 var_genes <- apply(logcounts, 1, var)
 head(var_genes)
@@ -261,7 +249,7 @@ png(file="High_var_genes.heatmap.png")
 heatmap.2(highly_variable_lcpm,col=rev(morecols(50)),trace="none", main="Top 500 most variable genes\nacross samples",ColSideColors=col.cell,scale="row")
 dev.off()
 ```
-```{r solutionChallenge3, fig.height=8, fig.width=6}
+```{r solutionChallenge3, fig.height=7, fig.width=6, echo=F}
 
 select_var <- names(sort(var_genes))[1:500]
 lowly_variable_lcpm <- logcounts[select_var,]
